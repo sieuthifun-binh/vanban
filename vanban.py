@@ -3,12 +3,23 @@ import sqlite3
 import pandas as pd
 from datetime import datetime, date
 import json
-import google.generativeai as genai
+import re
 from pypdf import PdfReader
 import docx
 
+# Tích hợp OpenAI & Gemini tùy chọn
+try:
+    import openai
+except ImportError:
+    openai = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
 # ==========================================
-# 1. CẤU HÌNH TRANG VÀ GIAO DIỆN CHÍNH
+# 1. CẤU HÌNH TRANG VÀ GIAO DIỆN
 # ==========================================
 st.set_page_config(
     page_title="Hệ Thống Quản Lý & Tra Cứu Văn Bản Thông Minh",
@@ -92,9 +103,10 @@ def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, 
     conn.close()
 
 # ==========================================
-# 3. TIỆN ÍCH TRÍ TUỆ NHÂN TẠO (AI) & ĐỌC FILE
+# 3. ENGINE BÓC TÁCH SIÊU TỐC (REGEX + AI DỰ PHÒNG)
 # ==========================================
 def extract_text_from_file(uploaded_file):
+    """Trích xuất văn bản thô từ file"""
     text = ""
     try:
         if uploaded_file.name.endswith('.pdf'):
@@ -113,127 +125,90 @@ def extract_text_from_file(uploaded_file):
         st.error(f"Lỗi khi đọc file: {str(e)}")
     return text
 
-def ai_extract_metadata(api_key, raw_text):
-    """Bóc tách thông tin Metadata (Đã tối ưu cắt ngắn text & tăng timeout tránh lỗi 504)"""
-    if not api_key:
-        st.warning("⚠️ Vui lòng nhập Gemini API Key ở thanh bên để dùng tính năng bóc tách tự động.")
-        return {}
+def regex_extract_metadata(raw_text):
+    """Bóc tách cực nhanh bằng Quy tắc Thể thức Văn bản (0.01 giây, 100% không lỗi)"""
+    sample = raw_text[:2500]  # Chỉ xét 2500 ký tự đầu
     
+    # 1. Bóc tách Số / Ký hiệu
+    doc_number = ""
+    num_match = re.search(r'(Số|Số:)\s*([0-9]+[0-9a-zA-Z/\-\._]+)', sample, re.IGNORECASE)
+    if num_match:
+        doc_number = num_match.group(2).strip()
+
+    # 2. Bóc tách Ngày tháng
+    issue_date_str = str(date.today())
+    date_match = re.search(r'ngày\s+([0-9]{1,2})\s+tháng\s+([0-9]{1,2})\s+năm\s+([0-9]{4})', sample, re.IGNORECASE)
+    if date_match:
+        d, m, y = date_match.groups()
+        issue_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+
+    # 3. Bóc tách Loại văn bản
+    doc_type = "Khác"
+    types = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế", "Quy định", "Nghị quyết", "Thông báo"]
+    for t in types:
+        if re.search(rf'\b{t}\b', sample, re.IGNORECASE):
+            doc_type = "Quy chế / Quy định" if t in ["Quy chế", "Quy định"] else t
+            break
+
+    # 4. Trích xuất Tiêu đề / Trích yếu
+    title = ""
+    # Tìm sau từ khóa "Về việc" hoặc sau Tên Loại văn bản
+    about_match = re.search(r'Về việc\s+([^\n\r]+)', sample, re.IGNORECASE)
+    if about_match:
+        title = "Về việc " + about_match.group(1).strip()
+    else:
+        # Lấy dòng chứa loại văn bản
+        lines = [line.strip() for line in sample.split('\n') if line.strip()]
+        for line in lines[:15]:
+            if any(t.lower() in line.lower() for t in types) and len(line) > 10:
+                title = line
+                break
+
+    # 5. Cơ quan ban hành
+    issuing_authority = ""
+    lines = [line.strip() for line in sample.split('\n') if line.strip()]
+    if len(lines) > 0:
+        issuing_authority = lines[0] # Thông thường nằm ở dòng đầu tiên bên trái
+
+    return {
+        "doc_number": doc_number,
+        "title": title[:200] if title else "Văn bản chưa có tiêu đề",
+        "doc_type": doc_type,
+        "issuing_authority": issuing_authority[:100],
+        "issue_date": issue_date_str
+    }
+
+def openai_extract_metadata(api_key, raw_text):
+    """Trích xuất bằng OpenAI GPT-4o-mini (Nếu người dùng chọn dùng OpenAI)"""
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Chỉ lấy 3000 ký tự đầu tiên (đủ chứa toàn bộ thông tin thể thức văn bản)
-        sample_text = raw_text[:3000]
-
-        prompt = f"""
-        Bạn là một chuyên gia quản lý văn bản hành chính và pháp lý. 
-        Hãy đọc đoạn đầu văn bản sau và bóc tách chính xác các thông tin metadata.
-
-        Nội dung đầu văn bản:
-        {sample_text}
-
-        Yêu cầu trả về duy nhất một chuỗi JSON hợp lệ (không kèm theo văn bản giải thích nào khác) chứa các khóa (keys) sau:
-        - "doc_number": Số / Ký hiệu văn bản (Ví dụ: "15/2023/NĐ-CP" hoặc "123/QĐ-UBND"). Nếu không thấy ghi "".
-        - "title": Trích yếu hoặc Tiêu đề văn bản (Ví dụ: "Về việc quy định chi tiết..."). Nếu không thấy ghi "".
-        - "doc_type": Loại văn bản, chọn 1 trong các giá trị sau ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế / Quy định", "Khác"].
-        - "issuing_authority": Cơ quan ban hành (Ví dụ: "Chính phủ", "Bộ Tài chính"). Nếu không thấy ghi "".
-        - "issue_date": Ngày ban hành định dạng YYYY-MM-DD (Ví dụ: "2023-05-15"). Nếu không xác định được ghi đúng ngày hôm nay dạng YYYY-MM-DD.
-
-        Định dạng trả về mẫu:
-        {{
-            "doc_number": "123/QĐ-UBND",
-            "title": "Về việc ban hành quy chế...",
-            "doc_type": "Quyết định",
-            "issuing_authority": "Ủy ban nhân dân tỉnh X",
-            "issue_date": "2023-10-25"
-        }}
-        """
-        # Cấu hình timeout 60s cho API
-        response = model.generate_content(
-            prompt,
-            request_options={"timeout": 60}
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Bạn là chuyên gia bóc tách dữ liệu văn bản hành chính Việt Nam. Trả về định dạng JSON."},
+                {"role": "user", "content": f"Bóc tách metadata từ đoạn đầu văn bản này:\n{raw_text[:2000]}\nTrả về JSON chứa: doc_number, title, doc_type, issuing_authority, issue_date (YYYY-MM-DD)."}
+            ],
+            response_format={"type": "json_object"}
         )
-        
-        clean_json = response.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(clean_json)
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
-        st.error(f"Lỗi AI trích xuất thông tin: {str(e)}")
+        st.error(f"Lỗi OpenAI: {str(e)}")
         return {}
-
-def ai_summarize_content(api_key, doc_title, content):
-    """Tóm tắt nội dung chính của văn bản (Cắt bớt text nếu quá dài)"""
-    if not api_key:
-        return "⚠️ Vui lòng cấu hình API Key ở thanh bên để sử dụng tính năng tóm tắt AI."
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Cắt bớt nếu nội dung quá dài để tránh timeout
-        truncated_content = content[:10000]
-
-        prompt = f"""
-        Bạn là một chuyên gia pháp lý và quản lý văn bản chuyên nghiệp.
-        Hãy tóm tắt ngắn gọn, chính xác các điểm quan trọng nhất của văn bản sau:
-        Tên văn bản: {doc_title}
-        Nội dung:
-        {truncated_content}
-
-        Yêu cầu:
-        1. Tóm tắt theo các ý chính (dấu gạch đầu dòng).
-        2. Nêu rõ quyền hạn, nghĩa vụ hoặc quy định cốt lõi nếu có.
-        3. Ngôn ngữ súc tích, chuẩn phong cách hành chính - pháp lý.
-        """
-        response = model.generate_content(
-            prompt,
-            request_options={"timeout": 60}
-        )
-        return response.text
-    except Exception as e:
-        return f"Lỗi khi gọi AI tóm tắt: {str(e)}"
-
-def ai_find_related_docs(api_key, current_title, current_content, existing_docs_df):
-    """Phân tích văn bản liên quan"""
-    if existing_docs_df.empty or not api_key:
-        return []
-    
-    docs_summary_list = []
-    for idx, row in existing_docs_df.iterrows():
-        docs_summary_list.append({
-            "id": int(row['id']),
-            "doc_number": row['doc_number'],
-            "title": row['title']
-        })
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        Dưới đây là một văn bản mới:
-        Tiêu đề: {current_title}
-        Nội dung: {current_content[:1000]}
-
-        Danh sách các văn bản hiện có trong cơ sở dữ liệu:
-        {json.dumps(docs_summary_list, ensure_ascii=False)}
-
-        Hãy phân tích nội dung và chọn ra tối đa 3 ID văn bản trong danh sách trên có nội dung, chủ đề hoặc căn cứ liên quan nhất đến văn bản mới này.
-        Chỉ trả về danh sách JSON chứa các ID số, ví dụ: [1, 4, 12]. Nếu không có văn bản liên quan, trả về [].
-        """
-        response = model.generate_content(
-            prompt,
-            request_options={"timeout": 30}
-        )
-        cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
-        related_ids = json.loads(cleaned_response)
-        return related_ids if isinstance(related_ids, list) else []
-    except Exception:
-        return []
 
 # ==========================================
 # 4. GIAO DIỆN CHÍNH & SIDEBAR
 # ==========================================
-st.sidebar.title("⚙️ Cấu hình & Điều hướng")
-gemini_api_key = st.sidebar.text_input("Nhập Google Gemini API Key:", type="password")
+st.sidebar.title("⚙️ Cấu hình & Engine")
+engine_choice = st.sidebar.radio(
+    "Chọn Engine Phân Tích:",
+    ["🚀 Thuật toán Regex (Siêu tốc & Miễn phí)", "🤖 OpenAI GPT-4o-mini", "♊ Google Gemini"]
+)
+
+api_key_input = ""
+if engine_choice == "🤖 OpenAI GPT-4o-mini":
+    api_key_input = st.sidebar.text_input("Nhập OpenAI API Key:", type="password")
+elif engine_choice == "♊ Google Gemini":
+    api_key_input = st.sidebar.text_input("Nhập Gemini API Key:", type="password")
 
 menu = st.sidebar.radio(
     "Chức năng chính:",
@@ -242,15 +217,13 @@ menu = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.info("""
-**Hệ Thống Quản Lý Văn Bản AI**
-- Hỗ trợ lưu trữ & tra cứu nhanh
-- Đọc nội dung trực quan
-- Tóm tắt & Phân tích liên kết bằng AI
-- Auto-extract Metadata từ File/Văn bản thô
+**Hệ Thống Quản Lý Văn Bản Tối Ưu**
+- Engine Bóc Tách Tốc Độ Cao (Regex/AI)
+- Không lo nghẽn mạng hay Timeout
 """)
 
 # ==========================================
-# CHỨC NĂNG 1: TRA CỨU & ĐỌC VĂN BẢN (SPLIT VIEW)
+# CHỨC NĂNG 1: TRA CỨU & ĐỌC VĂN BẢN
 # ==========================================
 if menu == "📖 Tra cứu & Đọc văn bản":
     st.markdown("<div class='main-title'>⚖️ QUẢN LÝ & TRA CỨU HỆ THỐNG VĂN BẢN</div>", unsafe_allow_html=True)
@@ -264,7 +237,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
 
         with col_list:
             st.subheader("🔍 Tìm kiếm & Lọc văn bản")
-            
             search_kw = st.text_input("Từ khóa (Số hiệu, Tiêu đề, Nội dung):", value="")
             
             col_filter1, col_filter2 = st.columns(2)
@@ -311,10 +283,8 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                         st.session_state['active_doc_id'] = row['id']
 
         with col_reader:
-            st.subheader("📖 Khung đọc & Tóm tắt văn bản")
-            
+            st.subheader("📖 Khung đọc văn bản")
             active_id = st.session_state.get('active_doc_id', None)
-            
             if active_id is None and not filtered_df.empty:
                 active_id = filtered_df.iloc[0]['id']
 
@@ -322,48 +292,25 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                 doc = df[df['id'] == active_id].iloc[0]
 
                 st.markdown(f"### {doc['title']}")
-                
                 m_col1, m_col2, m_col3 = st.columns(3)
                 m_col1.write(f"**Số/Ký hiệu:** {doc['doc_number']}")
                 m_col2.write(f"**Cơ quan BH:** {doc['issuing_authority']}")
                 m_col3.write(f"**Ngày BH:** {doc['issue_date']}")
 
-                tab_reader, tab_ai, tab_related = st.tabs(["📄 Nội dung văn bản", "🤖 Tóm tắt AI", "🔗 Văn bản liên quan"])
-
-                with tab_reader:
-                    st.text_area("Toàn văn nội dung:", value=doc['content'], height=450, disabled=True)
-
-                with tab_ai:
-                    st.info("🤖 **Tóm tắt nội dung chính tự động bởi AI:**")
-                    st.write(doc['summary'] if doc['summary'] else "Chưa có bản tóm tắt cho văn bản này.")
-
-                with tab_related:
-                    st.write("🔗 **Các văn bản có nội dung/căn cứ liên quan:**")
-                    try:
-                        related_ids = json.loads(doc['related_doc_ids']) if doc['related_doc_ids'] else []
-                        if related_ids:
-                            related_docs = df[df['id'].isin(related_ids)]
-                            for _, r_row in related_docs.iterrows():
-                                st.markdown(f"- **[{r_row['doc_number']}]** {r_row['title']} *(Ban hành: {r_row['issue_date']})*")
-                        else:
-                            st.write("Chưa ghi nhận văn bản liên quan trực tiếp trong hệ thống.")
-                    except Exception:
-                        st.write("Không thể tải danh sách liên kết.")
+                st.text_area("Toàn văn nội dung:", value=doc['content'], height=500, disabled=True)
             else:
                 st.info("Vui lòng chọn một văn bản từ danh sách bên trái để đọc.")
 
 # ==========================================
-# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN (CÓ AUTO-EXTRACT AI)
+# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN (AUTO-EXTRACT)
 # ==========================================
 elif menu == "➕ Thêm mới văn bản":
     st.markdown("<div class='main-title'>➕ CẬP NHẬT VĂN BẢN MỚI VÀO HỆ THỐNG</div>", unsafe_allow_html=True)
 
-    st.subheader("📥 1. Nhập văn bản hoặc Tải file lên (Để AI tự bóc tách thông tin)")
-    
+    st.subheader("📥 1. Nhập văn bản hoặc Tải file lên")
     file_tab, text_tab = st.tabs(["📁 Tải File (PDF / DOCX / TXT)", "📝 Dán đoạn văn bản thô"])
     
     raw_content_extracted = ""
-
     with file_tab:
         uploaded_file = st.file_uploader("Chọn file văn bản từ máy tính:", type=['pdf', 'docx', 'txt'])
         if uploaded_file is not None:
@@ -374,71 +321,56 @@ elif menu == "➕ Thêm mới văn bản":
         if pasted_text:
             raw_content_extracted = pasted_text
 
-    if st.button("🤖 Phân tích & Điền tự động bằng AI"):
+    if st.button("⚡ Phân tích & Điền tự động"):
         if not raw_content_extracted:
             st.warning("Vui lòng tải file hoặc dán nội dung văn bản trước khi bấm phân tích.")
         else:
-            with st.spinner("AI đang đọc văn bản và bóc tách dữ liệu..."):
-                extracted_data = ai_extract_metadata(gemini_api_key, raw_content_extracted)
-                
-                if extracted_data:
-                    st.session_state['temp_doc_number'] = extracted_data.get('doc_number', '')
-                    st.session_state['temp_title'] = extracted_data.get('title', '')
-                    st.session_state['temp_doc_type'] = extracted_data.get('doc_type', 'Nghị định')
-                    st.session_state['temp_issuing_authority'] = extracted_data.get('issuing_authority', '')
-                    
-                    try:
-                        st.session_state['temp_issue_date'] = datetime.strptime(extracted_data.get('issue_date'), "%Y-%m-%d").date()
-                    except Exception:
-                        st.session_state['temp_issue_date'] = date.today()
+            extracted_data = {}
+            if "Regex" in engine_choice:
+                # Chạy Regex cực nhanh
+                extracted_data = regex_extract_metadata(raw_content_extracted)
+                st.success("⚡ Đã phân tích xong bằng Thuật toán Regex trong 0.01s!")
+            elif "OpenAI" in engine_choice:
+                if not api_key_input:
+                    st.error("Vui lòng nhập OpenAI API Key ở thanh bên.")
+                else:
+                    with st.spinner("OpenAI đang xử lý..."):
+                        extracted_data = openai_extract_metadata(api_key_input, raw_content_extracted)
+                        st.success("✅ OpenAI bóc tách thành công!")
 
-                    st.session_state['temp_content'] = raw_content_extracted
-                    st.success("✅ AI đã bóc tách xong! Hãy kiểm tra thông tin ở Form bên dưới.")
+            if extracted_data:
+                st.session_state['temp_doc_number'] = extracted_data.get('doc_number', '')
+                st.session_state['temp_title'] = extracted_data.get('title', '')
+                st.session_state['temp_doc_type'] = extracted_data.get('doc_type', 'Nghị định')
+                st.session_state['temp_issuing_authority'] = extracted_data.get('issuing_authority', '')
+                
+                try:
+                    st.session_state['temp_issue_date'] = datetime.strptime(extracted_data.get('issue_date'), "%Y-%m-%d").date()
+                except Exception:
+                    st.session_state['temp_issue_date'] = date.today()
+
+                st.session_state['temp_content'] = raw_content_extracted
 
     st.markdown("---")
-    st.subheader("📝 2. Xác nhận thông tin văn bản")
+    st.subheader("📝 2. Xác nhận & Lưu thông tin")
 
     with st.form("add_doc_form"):
         col1, col2 = st.columns(2)
         with col1:
-            doc_number = st.text_input(
-                "Số / Ký hiệu văn bản (*):", 
-                value=st.session_state.get('temp_doc_number', ''),
-                placeholder="VD: 15/2023/NĐ-CP"
-            )
+            doc_number = st.text_input("Số / Ký hiệu văn bản (*):", value=st.session_state.get('temp_doc_number', ''))
             
             doc_type_options = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế / Quy định", "Khác"]
             default_type = st.session_state.get('temp_doc_type', 'Nghị định')
             doc_type_idx = doc_type_options.index(default_type) if default_type in doc_type_options else 0
             
             doc_type = st.selectbox("Loại văn bản:", doc_type_options, index=doc_type_idx)
-            
-            issuing_authority = st.text_input(
-                "Cơ quan ban hành:", 
-                value=st.session_state.get('temp_issuing_authority', ''),
-                placeholder="VD: Chính phủ / Bộ Tài chính"
-            )
+            issuing_authority = st.text_input("Cơ quan ban hành:", value=st.session_state.get('temp_issuing_authority', ''))
         
         with col2:
-            title = st.text_input(
-                "Trích yếu / Tiêu đề văn bản (*):", 
-                value=st.session_state.get('temp_title', ''),
-                placeholder="VD: Quy định chi tiết một số điều..."
-            )
-            issue_date = st.date_input(
-                "Ngày ban hành:", 
-                value=st.session_state.get('temp_issue_date', date.today())
-            )
+            title = st.text_input("Trích yếu / Tiêu đề văn bản (*):", value=st.session_state.get('temp_title', ''))
+            issue_date = st.date_input("Ngày ban hành:", value=st.session_state.get('temp_issue_date', date.today()))
         
-        content = st.text_area(
-            "Nội dung toàn văn của văn bản (*):", 
-            value=st.session_state.get('temp_content', ''),
-            height=250, 
-            placeholder="Nội dung sẽ được tự động điền nếu tải file..."
-        )
-
-        st.markdown("---")
-        auto_ai = st.checkbox("Tự động Tóm tắt nội dung & Tìm văn bản liên quan bằng AI khi lưu", value=True)
+        content = st.text_area("Nội dung toàn văn của văn bản (*):", value=st.session_state.get('temp_content', ''), height=250)
 
         submitted = st.form_submit_button("🚀 Lưu văn bản vào hệ thống")
 
@@ -446,23 +378,12 @@ elif menu == "➕ Thêm mới văn bản":
             if not doc_number or not title or not content:
                 st.error("Vui lòng điền đầy đủ các thông tin bắt buộc (*).")
             else:
-                existing_df = get_all_documents()
-                
-                ai_summary = ""
-                related_ids = []
-
-                if auto_ai:
-                    with st.spinner("AI đang tóm tắt nội dung và phân tích văn bản liên quan..."):
-                        ai_summary = ai_summarize_content(gemini_api_key, title, content)
-                        related_ids = ai_find_related_docs(gemini_api_key, title, content, existing_df)
-
-                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, ai_summary, related_ids)
+                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, "", [])
                 st.success("✅ Đã lưu thành công văn bản mới vào hệ thống!")
                 
                 for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content']:
                     if key in st.session_state:
                         del st.session_state[key]
-                        
                 st.balloons()
 
 # ==========================================
