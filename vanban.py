@@ -17,7 +17,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS cho giao diện chuyên nghiệp
 st.markdown("""
 <style>
     .main-title {
@@ -96,13 +95,14 @@ def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, 
 # 3. TIỆN ÍCH TRÍ TUỆ NHÂN TẠO (AI) & ĐỌC FILE
 # ==========================================
 def extract_text_from_file(uploaded_file):
-    """Trích xuất văn bản thô từ file PDF, DOCX hoặc TXT"""
     text = ""
     try:
         if uploaded_file.name.endswith('.pdf'):
             pdf_reader = PdfReader(uploaded_file)
             for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
         elif uploaded_file.name.endswith('.docx'):
             doc = docx.Document(uploaded_file)
             for para in doc.paragraphs:
@@ -114,19 +114,24 @@ def extract_text_from_file(uploaded_file):
     return text
 
 def ai_extract_metadata(api_key, raw_text):
-    """BỔ SUNG MỚI: AI Phân tích văn bản và tự động bóc tách các trường Metadata pháp lý"""
+    """Bóc tách thông tin Metadata (Đã tối ưu cắt ngắn text & tăng timeout tránh lỗi 504)"""
     if not api_key:
         st.warning("⚠️ Vui lòng nhập Gemini API Key ở thanh bên để dùng tính năng bóc tách tự động.")
         return {}
     
     try:
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Chỉ lấy 3000 ký tự đầu tiên (đủ chứa toàn bộ thông tin thể thức văn bản)
+        sample_text = raw_text[:3000]
+
         prompt = f"""
         Bạn là một chuyên gia quản lý văn bản hành chính và pháp lý. 
-        Hãy đọc đoạn văn bản sau và bóc tách chính xác các thông tin metadata.
+        Hãy đọc đoạn đầu văn bản sau và bóc tách chính xác các thông tin metadata.
 
-        Nội dung văn bản:
-        {raw_text[:3000]}
+        Nội dung đầu văn bản:
+        {sample_text}
 
         Yêu cầu trả về duy nhất một chuỗi JSON hợp lệ (không kèm theo văn bản giải thích nào khác) chứa các khóa (keys) sau:
         - "doc_number": Số / Ký hiệu văn bản (Ví dụ: "15/2023/NĐ-CP" hoặc "123/QĐ-UBND"). Nếu không thấy ghi "".
@@ -144,7 +149,12 @@ def ai_extract_metadata(api_key, raw_text):
             "issue_date": "2023-10-25"
         }}
         """
-        response = model.generate_content(prompt)
+        # Cấu hình timeout 60s cho API
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": 60}
+        )
+        
         clean_json = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(clean_json)
     except Exception as e:
@@ -152,30 +162,38 @@ def ai_extract_metadata(api_key, raw_text):
         return {}
 
 def ai_summarize_content(api_key, doc_title, content):
-    """Tóm tắt nội dung chính của văn bản bằng AI"""
+    """Tóm tắt nội dung chính của văn bản (Cắt bớt text nếu quá dài)"""
     if not api_key:
         return "⚠️ Vui lòng cấu hình API Key ở thanh bên để sử dụng tính năng tóm tắt AI."
     try:
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Cắt bớt nếu nội dung quá dài để tránh timeout
+        truncated_content = content[:10000]
+
         prompt = f"""
         Bạn là một chuyên gia pháp lý và quản lý văn bản chuyên nghiệp.
         Hãy tóm tắt ngắn gọn, chính xác các điểm quan trọng nhất của văn bản sau:
         Tên văn bản: {doc_title}
         Nội dung:
-        {content}
+        {truncated_content}
 
         Yêu cầu:
         1. Tóm tắt theo các ý chính (dấu gạch đầu dòng).
         2. Nêu rõ quyền hạn, nghĩa vụ hoặc quy định cốt lõi nếu có.
         3. Ngôn ngữ súc tích, chuẩn phong cách hành chính - pháp lý.
         """
-        response = model.generate_content(prompt)
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": 60}
+        )
         return response.text
     except Exception as e:
-        return f"Lỗi khi gọi AI: {str(e)}"
+        return f"Lỗi khi gọi AI tóm tắt: {str(e)}"
 
 def ai_find_related_docs(api_key, current_title, current_content, existing_docs_df):
-    """Tự động phân tích và gợi ý các văn bản liên quan trong hệ thống"""
+    """Phân tích văn bản liên quan"""
     if existing_docs_df.empty or not api_key:
         return []
     
@@ -188,11 +206,12 @@ def ai_find_related_docs(api_key, current_title, current_content, existing_docs_
         })
 
     try:
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
         Dưới đây là một văn bản mới:
         Tiêu đề: {current_title}
-        Nội dung: {current_content[:1500]}
+        Nội dung: {current_content[:1000]}
 
         Danh sách các văn bản hiện có trong cơ sở dữ liệu:
         {json.dumps(docs_summary_list, ensure_ascii=False)}
@@ -200,7 +219,10 @@ def ai_find_related_docs(api_key, current_title, current_content, existing_docs_
         Hãy phân tích nội dung và chọn ra tối đa 3 ID văn bản trong danh sách trên có nội dung, chủ đề hoặc căn cứ liên quan nhất đến văn bản mới này.
         Chỉ trả về danh sách JSON chứa các ID số, ví dụ: [1, 4, 12]. Nếu không có văn bản liên quan, trả về [].
         """
-        response = model.generate_content(prompt)
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": 30}
+        )
         cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
         related_ids = json.loads(cleaned_response)
         return related_ids if isinstance(related_ids, list) else []
@@ -238,7 +260,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
     if df.empty:
         st.warning("Hệ thống chưa có văn bản nào. Vui lòng chuyển sang mục 'Thêm mới văn bản' để tải lên!")
     else:
-        # Bố cục 2 khung kế bên nhau
         col_list, col_reader = st.columns([5, 7])
 
         with col_list:
@@ -337,9 +358,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
 elif menu == "➕ Thêm mới văn bản":
     st.markdown("<div class='main-title'>➕ CẬP NHẬT VĂN BẢN MỚI VÀO HỆ THỐNG</div>", unsafe_allow_html=True)
 
-    # -------------------------------------------------------------
-    # BỔ SUNG MỚI: MODULE NHẬP FILE HOẶC VĂN BẢN ĐỂ AI TỰ BÓC TÁCH
-    # -------------------------------------------------------------
     st.subheader("📥 1. Nhập văn bản hoặc Tải file lên (Để AI tự bóc tách thông tin)")
     
     file_tab, text_tab = st.tabs(["📁 Tải File (PDF / DOCX / TXT)", "📝 Dán đoạn văn bản thô"])
@@ -380,7 +398,6 @@ elif menu == "➕ Thêm mới văn bản":
     st.markdown("---")
     st.subheader("📝 2. Xác nhận thông tin văn bản")
 
-    # Form nhập liệu (Lấy giá trị mặc định từ Session State do AI điền)
     with st.form("add_doc_form"):
         col1, col2 = st.columns(2)
         with col1:
@@ -442,7 +459,6 @@ elif menu == "➕ Thêm mới văn bản":
                 insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, ai_summary, related_ids)
                 st.success("✅ Đã lưu thành công văn bản mới vào hệ thống!")
                 
-                # Reset bộ nhớ tạm sau khi lưu
                 for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content']:
                     if key in st.session_state:
                         del st.session_state[key]
