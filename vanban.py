@@ -1,10 +1,11 @@
-
 import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, date
 import json
 import google.generativeai as genai
+from pypdf import PdfReader
+import docx
 
 # ==========================================
 # 1. CẤU HÌNH TRANG VÀ GIAO DIỆN CHÍNH
@@ -92,13 +93,63 @@ def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, 
     conn.close()
 
 # ==========================================
-# 3. TIỆN ÍCH TRÍ TUỆ NHÂN TẠO (AI)
+# 3. TIỆN ÍCH TRÍ TUỆ NHÂN TẠO (AI) & ĐỌC FILE
 # ==========================================
-def configure_ai(api_key):
-    if api_key:
-        genai.configure(api_key=api_key)
-        return True
-    return False
+def extract_text_from_file(uploaded_file):
+    """Trích xuất văn bản thô từ file PDF, DOCX hoặc TXT"""
+    text = ""
+    try:
+        if uploaded_file.name.endswith('.pdf'):
+            pdf_reader = PdfReader(uploaded_file)
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+        elif uploaded_file.name.endswith('.docx'):
+            doc = docx.Document(uploaded_file)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        elif uploaded_file.name.endswith('.txt'):
+            text = uploaded_file.read().decode('utf-8')
+    except Exception as e:
+        st.error(f"Lỗi khi đọc file: {str(e)}")
+    return text
+
+def ai_extract_metadata(api_key, raw_text):
+    """BỔ SUNG MỚI: AI Phân tích văn bản và tự động bóc tách các trường Metadata pháp lý"""
+    if not api_key:
+        st.warning("⚠️ Vui lòng nhập Gemini API Key ở thanh bên để dùng tính năng bóc tách tự động.")
+        return {}
+    
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""
+        Bạn là một chuyên gia quản lý văn bản hành chính và pháp lý. 
+        Hãy đọc đoạn văn bản sau và bóc tách chính xác các thông tin metadata.
+
+        Nội dung văn bản:
+        {raw_text[:3000]}
+
+        Yêu cầu trả về duy nhất một chuỗi JSON hợp lệ (không kèm theo văn bản giải thích nào khác) chứa các khóa (keys) sau:
+        - "doc_number": Số / Ký hiệu văn bản (Ví dụ: "15/2023/NĐ-CP" hoặc "123/QĐ-UBND"). Nếu không thấy ghi "".
+        - "title": Trích yếu hoặc Tiêu đề văn bản (Ví dụ: "Về việc quy định chi tiết..."). Nếu không thấy ghi "".
+        - "doc_type": Loại văn bản, chọn 1 trong các giá trị sau ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế / Quy định", "Khác"].
+        - "issuing_authority": Cơ quan ban hành (Ví dụ: "Chính phủ", "Bộ Tài chính"). Nếu không thấy ghi "".
+        - "issue_date": Ngày ban hành định dạng YYYY-MM-DD (Ví dụ: "2023-05-15"). Nếu không xác định được ghi đúng ngày hôm nay dạng YYYY-MM-DD.
+
+        Định dạng trả về mẫu:
+        {{
+            "doc_number": "123/QĐ-UBND",
+            "title": "Về việc ban hành quy chế...",
+            "doc_type": "Quyết định",
+            "issuing_authority": "Ủy ban nhân dân tỉnh X",
+            "issue_date": "2023-10-25"
+        }}
+        """
+        response = model.generate_content(prompt)
+        clean_json = response.text.strip().replace("```json", "").replace("```", "")
+        return json.loads(clean_json)
+    except Exception as e:
+        st.error(f"Lỗi AI trích xuất thông tin: {str(e)}")
+        return {}
 
 def ai_summarize_content(api_key, doc_title, content):
     """Tóm tắt nội dung chính của văn bản bằng AI"""
@@ -173,6 +224,7 @@ st.sidebar.info("""
 - Hỗ trợ lưu trữ & tra cứu nhanh
 - Đọc nội dung trực quan
 - Tóm tắt & Phân tích liên kết bằng AI
+- Auto-extract Metadata từ File/Văn bản thô
 """)
 
 # ==========================================
@@ -186,13 +238,12 @@ if menu == "📖 Tra cứu & Đọc văn bản":
     if df.empty:
         st.warning("Hệ thống chưa có văn bản nào. Vui lòng chuyển sang mục 'Thêm mới văn bản' để tải lên!")
     else:
-        # Bố cục 2 khung kế bên nhau (Left: Tìm kiếm & Danh sách | Right: Đọc nội dung)
+        # Bố cục 2 khung kế bên nhau
         col_list, col_reader = st.columns([5, 7])
 
         with col_list:
             st.subheader("🔍 Tìm kiếm & Lọc văn bản")
             
-            # Khung tìm kiếm & Lọc
             search_kw = st.text_input("Từ khóa (Số hiệu, Tiêu đề, Nội dung):", value="")
             
             col_filter1, col_filter2 = st.columns(2)
@@ -203,7 +254,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                 max_date = pd.to_datetime(df['issue_date']).max().date() if not df.empty else date.today()
                 date_range = st.date_input("Khoảng ngày ban hành:", [min_date, max_date])
 
-            # Áp dụng bộ lọc
             filtered_df = df.copy()
 
             if search_kw:
@@ -227,8 +277,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
 
             st.caption(f"Tìm thấy **{len(filtered_df)}** văn bản (Sắp xếp theo ngày cập nhật mới nhất):")
 
-            # Danh sách văn bản
-            selected_doc_id = None
             for idx, row in filtered_df.iterrows():
                 with st.container():
                     st.markdown(f"""
@@ -244,18 +292,16 @@ if menu == "📖 Tra cứu & Đọc văn bản":
         with col_reader:
             st.subheader("📖 Khung đọc & Tóm tắt văn bản")
             
-            # Lấy văn bản được chọn
             active_id = st.session_state.get('active_doc_id', None)
             
             if active_id is None and not filtered_df.empty:
-                active_id = filtered_df.iloc[0]['id'] # Mặc định chọn văn bản đầu tiên
+                active_id = filtered_df.iloc[0]['id']
 
             if active_id:
                 doc = df[df['id'] == active_id].iloc[0]
 
                 st.markdown(f"### {doc['title']}")
                 
-                # Metadata văn bản
                 m_col1, m_col2, m_col3 = st.columns(3)
                 m_col1.write(f"**Số/Ký hiệu:** {doc['doc_number']}")
                 m_col2.write(f"**Cơ quan BH:** {doc['issuing_authority']}")
@@ -286,23 +332,93 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                 st.info("Vui lòng chọn một văn bản từ danh sách bên trái để đọc.")
 
 # ==========================================
-# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN & PHÂN TÍCH AI
+# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN (CÓ AUTO-EXTRACT AI)
 # ==========================================
 elif menu == "➕ Thêm mới văn bản":
     st.markdown("<div class='main-title'>➕ CẬP NHẬT VĂN BẢN MỚI VÀO HỆ THỐNG</div>", unsafe_allow_html=True)
 
+    # -------------------------------------------------------------
+    # BỔ SUNG MỚI: MODULE NHẬP FILE HOẶC VĂN BẢN ĐỂ AI TỰ BÓC TÁCH
+    # -------------------------------------------------------------
+    st.subheader("📥 1. Nhập văn bản hoặc Tải file lên (Để AI tự bóc tách thông tin)")
+    
+    file_tab, text_tab = st.tabs(["📁 Tải File (PDF / DOCX / TXT)", "📝 Dán đoạn văn bản thô"])
+    
+    raw_content_extracted = ""
+
+    with file_tab:
+        uploaded_file = st.file_uploader("Chọn file văn bản từ máy tính:", type=['pdf', 'docx', 'txt'])
+        if uploaded_file is not None:
+            raw_content_extracted = extract_text_from_file(uploaded_file)
+
+    with text_tab:
+        pasted_text = st.text_area("Dán nội dung văn bản thô tại đây:", height=150)
+        if pasted_text:
+            raw_content_extracted = pasted_text
+
+    if st.button("🤖 Phân tích & Điền tự động bằng AI"):
+        if not raw_content_extracted:
+            st.warning("Vui lòng tải file hoặc dán nội dung văn bản trước khi bấm phân tích.")
+        else:
+            with st.spinner("AI đang đọc văn bản và bóc tách dữ liệu..."):
+                extracted_data = ai_extract_metadata(gemini_api_key, raw_content_extracted)
+                
+                if extracted_data:
+                    st.session_state['temp_doc_number'] = extracted_data.get('doc_number', '')
+                    st.session_state['temp_title'] = extracted_data.get('title', '')
+                    st.session_state['temp_doc_type'] = extracted_data.get('doc_type', 'Nghị định')
+                    st.session_state['temp_issuing_authority'] = extracted_data.get('issuing_authority', '')
+                    
+                    try:
+                        st.session_state['temp_issue_date'] = datetime.strptime(extracted_data.get('issue_date'), "%Y-%m-%d").date()
+                    except Exception:
+                        st.session_state['temp_issue_date'] = date.today()
+
+                    st.session_state['temp_content'] = raw_content_extracted
+                    st.success("✅ AI đã bóc tách xong! Hãy kiểm tra thông tin ở Form bên dưới.")
+
+    st.markdown("---")
+    st.subheader("📝 2. Xác nhận thông tin văn bản")
+
+    # Form nhập liệu (Lấy giá trị mặc định từ Session State do AI điền)
     with st.form("add_doc_form"):
         col1, col2 = st.columns(2)
         with col1:
-            doc_number = st.text_input("Số / Ký hiệu văn bản (*):", placeholder="VD: 15/2023/NĐ-CP")
-            doc_type = st.selectbox("Loại văn bản:", ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế / Quy định", "Khác"])
-            issuing_authority = st.text_input("Cơ quan ban hành:", placeholder="VD: Chính phủ / Bộ Tài chính")
+            doc_number = st.text_input(
+                "Số / Ký hiệu văn bản (*):", 
+                value=st.session_state.get('temp_doc_number', ''),
+                placeholder="VD: 15/2023/NĐ-CP"
+            )
+            
+            doc_type_options = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế / Quy định", "Khác"]
+            default_type = st.session_state.get('temp_doc_type', 'Nghị định')
+            doc_type_idx = doc_type_options.index(default_type) if default_type in doc_type_options else 0
+            
+            doc_type = st.selectbox("Loại văn bản:", doc_type_options, index=doc_type_idx)
+            
+            issuing_authority = st.text_input(
+                "Cơ quan ban hành:", 
+                value=st.session_state.get('temp_issuing_authority', ''),
+                placeholder="VD: Chính phủ / Bộ Tài chính"
+            )
         
         with col2:
-            title = st.text_input("Trích yếu / Tiêu đề văn bản (*):", placeholder="VD: Quy định chi tiết một số điều...")
-            issue_date = st.date_input("Ngày ban hành:", value=date.today())
+            title = st.text_input(
+                "Trích yếu / Tiêu đề văn bản (*):", 
+                value=st.session_state.get('temp_title', ''),
+                placeholder="VD: Quy định chi tiết một số điều..."
+            )
+            issue_date = st.date_input(
+                "Ngày ban hành:", 
+                value=st.session_state.get('temp_issue_date', date.today())
+            )
         
-        content = st.text_area("Nội dung toàn văn của văn bản (*):", height=250, placeholder="Dán toàn bộ nội dung văn bản vào đây...")
+        content = st.text_area(
+            "Nội dung toàn văn của văn bản (*):", 
+            value=st.session_state.get('temp_content', ''),
+            height=250, 
+            placeholder="Nội dung sẽ được tự động điền nếu tải file..."
+        )
 
         st.markdown("---")
         auto_ai = st.checkbox("Tự động Tóm tắt nội dung & Tìm văn bản liên quan bằng AI khi lưu", value=True)
@@ -319,12 +435,18 @@ elif menu == "➕ Thêm mới văn bản":
                 related_ids = []
 
                 if auto_ai:
-                    with st.spinner("AI đang phân tích, tóm tắt và liên kết văn bản..."):
+                    with st.spinner("AI đang tóm tắt nội dung và phân tích văn bản liên quan..."):
                         ai_summary = ai_summarize_content(gemini_api_key, title, content)
                         related_ids = ai_find_related_docs(gemini_api_key, title, content, existing_df)
 
                 insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, ai_summary, related_ids)
                 st.success("✅ Đã lưu thành công văn bản mới vào hệ thống!")
+                
+                # Reset bộ nhớ tạm sau khi lưu
+                for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                        
                 st.balloons()
 
 # ==========================================
