@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime, date
 import json
 import re
+import base64
 from pypdf import PdfReader
 import docx
 
@@ -55,6 +56,11 @@ st.markdown("""
         border-radius: 12px;
         font-size: 12px;
     }
+    .pdf-viewer {
+        border: 1px solid #CBD5E1;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -66,6 +72,7 @@ DB_FILE = "doc_management.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # Thêm trường file_bytes và file_name để lưu dữ liệu nhị phân nguyên bản
     c.execute('''
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +84,9 @@ def init_db():
             content TEXT,
             summary TEXT,
             related_doc_ids TEXT,
-            updated_at TIMESTAMP
+            updated_at TIMESTAMP,
+            file_bytes BLOB,
+            file_name TEXT
         )
     ''')
     conn.commit()
@@ -87,18 +96,41 @@ init_db()
 
 def get_all_documents():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM documents ORDER BY updated_at DESC", conn)
+    df = pd.read_sql_query("SELECT id, doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, updated_at, file_name FROM documents ORDER BY updated_at DESC", conn)
     conn.close()
     return df
 
-def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids):
+def get_document_by_id(doc_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "doc_number": row[1],
+            "title": row[2],
+            "doc_type": row[3],
+            "issuing_authority": row[4],
+            "issue_date": row[5],
+            "content": row[6],
+            "summary": row[7],
+            "related_doc_ids": row[8],
+            "updated_at": row[9],
+            "file_bytes": row[10],
+            "file_name": row[11]
+        }
+    return None
+
+def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, file_bytes=None, file_name=""):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute('''
-        INSERT INTO documents (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, json.dumps(related_doc_ids), now))
+        INSERT INTO documents (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, updated_at, file_bytes, file_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, json.dumps(related_doc_ids), now, file_bytes, file_name))
     conn.commit()
     conn.close()
 
@@ -127,22 +159,19 @@ def extract_text_from_file(uploaded_file):
 
 def regex_extract_metadata(raw_text):
     """Bóc tách cực nhanh bằng Quy tắc Thể thức Văn bản (0.01 giây, 100% không lỗi)"""
-    sample = raw_text[:2500]  # Chỉ xét 2500 ký tự đầu
+    sample = raw_text[:2500]
     
-    # 1. Bóc tách Số / Ký hiệu
     doc_number = ""
     num_match = re.search(r'(Số|Số:)\s*([0-9]+[0-9a-zA-Z/\-\._]+)', sample, re.IGNORECASE)
     if num_match:
         doc_number = num_match.group(2).strip()
 
-    # 2. Bóc tách Ngày tháng
     issue_date_str = str(date.today())
     date_match = re.search(r'ngày\s+([0-9]{1,2})\s+tháng\s+([0-9]{1,2})\s+năm\s+([0-9]{4})', sample, re.IGNORECASE)
     if date_match:
         d, m, y = date_match.groups()
         issue_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
 
-    # 3. Bóc tách Loại văn bản
     doc_type = "Khác"
     types = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế", "Quy định", "Nghị quyết", "Thông báo"]
     for t in types:
@@ -150,25 +179,21 @@ def regex_extract_metadata(raw_text):
             doc_type = "Quy chế / Quy định" if t in ["Quy chế", "Quy định"] else t
             break
 
-    # 4. Trích xuất Tiêu đề / Trích yếu
     title = ""
-    # Tìm sau từ khóa "Về việc" hoặc sau Tên Loại văn bản
     about_match = re.search(r'Về việc\s+([^\n\r]+)', sample, re.IGNORECASE)
     if about_match:
         title = "Về việc " + about_match.group(1).strip()
     else:
-        # Lấy dòng chứa loại văn bản
         lines = [line.strip() for line in sample.split('\n') if line.strip()]
         for line in lines[:15]:
             if any(t.lower() in line.lower() for t in types) and len(line) > 10:
                 title = line
                 break
 
-    # 5. Cơ quan ban hành
     issuing_authority = ""
     lines = [line.strip() for line in sample.split('\n') if line.strip()]
     if len(lines) > 0:
-        issuing_authority = lines[0] # Thông thường nằm ở dòng đầu tiên bên trái
+        issuing_authority = lines[0]
 
     return {
         "doc_number": doc_number,
@@ -179,7 +204,6 @@ def regex_extract_metadata(raw_text):
     }
 
 def openai_extract_metadata(api_key, raw_text):
-    """Trích xuất bằng OpenAI GPT-4o-mini (Nếu người dùng chọn dùng OpenAI)"""
     try:
         client = openai.OpenAI(api_key=api_key)
         response = client.chat.completions.create(
@@ -219,7 +243,7 @@ st.sidebar.markdown("---")
 st.sidebar.info("""
 **Hệ Thống Quản Lý Văn Bản Tối Ưu**
 - Engine Bóc Tách Tốc Độ Cao (Regex/AI)
-- Không lo nghẽn mạng hay Timeout
+- Trình xem PDF/Văn bản gốc chuẩn Foxit Reader
 """)
 
 # ==========================================
@@ -283,21 +307,47 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                         st.session_state['active_doc_id'] = row['id']
 
         with col_reader:
-            st.subheader("📖 Khung đọc văn bản")
+            st.subheader("📖 Khung đọc văn bản nguyên bản")
             active_id = st.session_state.get('active_doc_id', None)
             if active_id is None and not filtered_df.empty:
                 active_id = filtered_df.iloc[0]['id']
 
             if active_id:
-                doc = df[df['id'] == active_id].iloc[0]
+                doc_data = get_document_by_id(active_id)
 
-                st.markdown(f"### {doc['title']}")
-                m_col1, m_col2, m_col3 = st.columns(3)
-                m_col1.write(f"**Số/Ký hiệu:** {doc['doc_number']}")
-                m_col2.write(f"**Cơ quan BH:** {doc['issuing_authority']}")
-                m_col3.write(f"**Ngày BH:** {doc['issue_date']}")
+                if doc_data:
+                    st.markdown(f"### {doc_data['title']}")
+                    m_col1, m_col2, m_col3 = st.columns(3)
+                    m_col1.write(f"**Số/Ký hiệu:** {doc_data['doc_number']}")
+                    m_col2.write(f"**Cơ quan BH:** {doc_data['issuing_authority']}")
+                    m_col3.write(f"**Ngày BH:** {doc_data['issue_date']}")
 
-                st.text_area("Toàn văn nội dung:", value=doc['content'], height=500, disabled=True)
+                    view_type = st.radio("Chế độ xem:", ["📄 Văn bản nguyên bản (Foxit Style)", "📝 Văn bản trích xuất"], horizontal=True)
+
+                    if "nguyên bản" in view_type:
+                        if doc_data['file_bytes']:
+                            file_bytes = doc_data['file_bytes']
+                            file_name = doc_data['file_name'] or "document.pdf"
+                            
+                            # Xử lý xem nguyên bản PDF như Foxit Reader
+                            if file_name.lower().endswith('.pdf'):
+                                base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
+                                pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="650px" type="application/pdf" class="pdf-viewer"></iframe>'
+                                st.markdown(pdf_display, unsafe_allow_html=True)
+                            else:
+                                st.info("Văn bản gốc không phải định dạng PDF. Bạn có thể tải file gốc về máy để xem:")
+                                st.download_button(
+                                    label=f"📥 Tải xuống file gốc ({file_name})",
+                                    data=file_bytes,
+                                    file_name=file_name,
+                                    mime="application/octet-stream"
+                                )
+                                st.text_area("Toàn văn nội dung:", value=doc_data['content'], height=500, disabled=True)
+                        else:
+                            st.warning("Văn bản này được thêm dạng văn bản thô (chưa tải file gốc lên).")
+                            st.text_area("Toàn văn nội dung:", value=doc_data['content'], height=500, disabled=True)
+                    else:
+                        st.text_area("Toàn văn nội dung trích xuất:", value=doc_data['content'], height=500, disabled=True)
             else:
                 st.info("Vui lòng chọn một văn bản từ danh sách bên trái để đọc.")
 
@@ -311,15 +361,24 @@ elif menu == "➕ Thêm mới văn bản":
     file_tab, text_tab = st.tabs(["📁 Tải File (PDF / DOCX / TXT)", "📝 Dán đoạn văn bản thô"])
     
     raw_content_extracted = ""
+    uploaded_bytes = None
+    uploaded_filename = ""
+
     with file_tab:
         uploaded_file = st.file_uploader("Chọn file văn bản từ máy tính:", type=['pdf', 'docx', 'txt'])
         if uploaded_file is not None:
+            uploaded_bytes = uploaded_file.getvalue()
+            uploaded_filename = uploaded_file.name
             raw_content_extracted = extract_text_from_file(uploaded_file)
+            st.session_state['uploaded_bytes'] = uploaded_bytes
+            st.session_state['uploaded_filename'] = uploaded_filename
 
     with text_tab:
         pasted_text = st.text_area("Dán nội dung văn bản thô tại đây:", height=150)
         if pasted_text:
             raw_content_extracted = pasted_text
+            st.session_state['uploaded_bytes'] = None
+            st.session_state['uploaded_filename'] = ""
 
     if st.button("⚡ Phân tích & Điền tự động"):
         if not raw_content_extracted:
@@ -327,7 +386,6 @@ elif menu == "➕ Thêm mới văn bản":
         else:
             extracted_data = {}
             if "Regex" in engine_choice:
-                # Chạy Regex cực nhanh
                 extracted_data = regex_extract_metadata(raw_content_extracted)
                 st.success("⚡ Đã phân tích xong bằng Thuật toán Regex trong 0.01s!")
             elif "OpenAI" in engine_choice:
@@ -378,10 +436,13 @@ elif menu == "➕ Thêm mới văn bản":
             if not doc_number or not title or not content:
                 st.error("Vui lòng điền đầy đủ các thông tin bắt buộc (*).")
             else:
-                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, "", [])
+                f_bytes = st.session_state.get('uploaded_bytes', None)
+                f_name = st.session_state.get('uploaded_filename', '')
+
+                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, "", [], f_bytes, f_name)
                 st.success("✅ Đã lưu thành công văn bản mới vào hệ thống!")
                 
-                for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content']:
+                for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content', 'uploaded_bytes', 'uploaded_filename']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.balloons()
