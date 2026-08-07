@@ -65,14 +65,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (SQLITE)
+# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (TỰ ĐỘNG NÂNG CẤP BẢNG)
 # ==========================================
 DB_FILE = "doc_management.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Thêm trường file_bytes và file_name để lưu dữ liệu nhị phân nguyên bản
+    # Tạo bảng nếu chưa tồn tại
     c.execute('''
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +89,16 @@ def init_db():
             file_name TEXT
         )
     ''')
+    
+    # TỰ ĐỘNG NÂNG CẤP: Kiểm tra và bổ sung cột còn thiếu nếu file DB đã tồn tại từ trước
+    c.execute("PRAGMA table_info(documents)")
+    existing_columns = [col[1] for col in c.fetchall()]
+    
+    if 'file_bytes' not in existing_columns:
+        c.execute("ALTER TABLE documents ADD COLUMN file_bytes BLOB")
+    if 'file_name' not in existing_columns:
+        c.execute("ALTER TABLE documents ADD COLUMN file_name TEXT")
+        
     conn.commit()
     conn.close()
 
@@ -107,19 +117,27 @@ def get_document_by_id(doc_id):
     row = c.fetchone()
     conn.close()
     if row:
+        # Ánh xạ động theo tên cột
+        conn_check = sqlite3.connect(DB_FILE)
+        cursor_check = conn_check.cursor()
+        cursor_check.execute("SELECT * FROM documents LIMIT 1")
+        col_names = [description[0] for description in cursor_check.description]
+        conn_check.close()
+        
+        doc_dict = dict(zip(col_names, row))
         return {
-            "id": row[0],
-            "doc_number": row[1],
-            "title": row[2],
-            "doc_type": row[3],
-            "issuing_authority": row[4],
-            "issue_date": row[5],
-            "content": row[6],
-            "summary": row[7],
-            "related_doc_ids": row[8],
-            "updated_at": row[9],
-            "file_bytes": row[10],
-            "file_name": row[11]
+            "id": doc_dict.get("id"),
+            "doc_number": doc_dict.get("doc_number", ""),
+            "title": doc_dict.get("title", ""),
+            "doc_type": doc_dict.get("doc_type", ""),
+            "issuing_authority": doc_dict.get("issuing_authority", ""),
+            "issue_date": doc_dict.get("issue_date", ""),
+            "content": doc_dict.get("content", ""),
+            "summary": doc_dict.get("summary", ""),
+            "related_doc_ids": doc_dict.get("related_doc_ids", ""),
+            "updated_at": doc_dict.get("updated_at", ""),
+            "file_bytes": doc_dict.get("file_bytes", None),
+            "file_name": doc_dict.get("file_name", "")
         }
     return None
 
@@ -329,7 +347,6 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                             file_bytes = doc_data['file_bytes']
                             file_name = doc_data['file_name'] or "document.pdf"
                             
-                            # Xử lý xem nguyên bản PDF như Foxit Reader
                             if file_name.lower().endswith('.pdf'):
                                 base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
                                 pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="650px" type="application/pdf" class="pdf-viewer"></iframe>'
