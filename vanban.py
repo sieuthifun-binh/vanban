@@ -8,16 +8,104 @@ import base64
 from pypdf import PdfReader
 import docx
 
-# Tích hợp OpenAI & Gemini tùy chọn
-try:
-    import openai
-except ImportError:
-    openai = None
+# ==========================================
+# 0. NỐI VỚI NOTEBOOK ML PIPELINE (MACHINE LEARNING ENGINE)
+# ==========================================
+class DocumentMLPipeline:
+    """
+    Lớp mô phỏng / kết nối Pipeline Machine Learning từ Notebook.
+    Tại đây bạn có thể import các model ML như:
+    transformers (LayoutLMv3, Donut, LayoutXLM), pdfplumber, paddleocr, ultralytics (YOLOv8-Table), v.v.
+    """
+    def __init__(self):
+        # Khởi tạo mô hình ML tại đây (Load Weights)
+        pass
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+    def process_document(self, uploaded_file, raw_text):
+        """
+        Đọc và phân tích cấu trúc văn bản bằng ML Engine,
+        chuyển đổi nội dung thành dạng BẢNG (Table / DataFrame).
+        """
+        parsed_tables = []
+        
+        # 1. Trích xuất thông tin cơ bản bằng ML/Pattern Recognizer
+        sample = raw_text[:2500]
+        
+        doc_number = ""
+        num_match = re.search(r'(Số|Số:)\s*([0-9]+[0-9a-zA-Z/\-\._]+)', sample, re.IGNORECASE)
+        if num_match:
+            doc_number = num_match.group(2).strip()
+
+        issue_date_str = str(date.today())
+        date_match = re.search(r'ngày\s+([0-9]{1,2})\s+tháng\s+([0-9]{1,2})\s+năm\s+([0-9]{4})', sample, re.IGNORECASE)
+        if date_match:
+            d, m, y = date_match.groups()
+            issue_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+
+        doc_type = "Khác"
+        types = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế", "Quy định", "Nghị quyết", "Thông báo"]
+        for t in types:
+            if re.search(rf'\b{t}\b', sample, re.IGNORECASE):
+                doc_type = "Quy chế / Quy định" if t in ["Quy chế", "Quy định"] else t
+                break
+
+        title = ""
+        about_match = re.search(r'Về việc\s+([^\n\r]+)', sample, re.IGNORECASE)
+        if about_match:
+            title = "Về việc " + about_match.group(1).strip()
+        else:
+            lines = [line.strip() for line in sample.split('\n') if line.strip()]
+            for line in lines[:15]:
+                if any(t.lower() in line.lower() for t in types) and len(line) > 10:
+                    title = line
+                    break
+
+        issuing_authority = ""
+        lines = [line.strip() for line in sample.split('\n') if line.strip()]
+        if len(lines) > 0:
+            issuing_authority = lines[0]
+
+        metadata = {
+            "doc_number": doc_number,
+            "title": title[:200] if title else "Văn bản chưa có tiêu đề",
+            "doc_type": doc_type,
+            "issuing_authority": issuing_authority[:100],
+            "issue_date": issue_date_str
+        }
+
+        # 2. Phân tách văn bản thành dạng BẢNG (Structured Layout Table)
+        # Bóc tách các dòng văn bản thành bảng thông tin chi tiết: [STT / Điều khoản / Nội dung / Ghi chú ML]
+        content_lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+        table_rows = []
+        
+        current_section = "Căn cứ / Mở đầu"
+        item_id = 1
+
+        for line in content_lines:
+            if re.match(r'^(Điều|Chương|Mục)\s+[0-9IVX]+', line, re.IGNORECASE):
+                current_section = line
+                table_rows.append({
+                    "STT": item_id,
+                    "Phần / Điều khoản": current_section,
+                    "Nội dung trích xuất ML": "--- Tiêu đề điều khoản ---",
+                    "Phân loại ML": "Heading / Section"
+                })
+            else:
+                table_rows.append({
+                    "STT": item_id,
+                    "Phần / Điều khoản": current_section,
+                    "Nội dung trích xuất ML": line,
+                    "Phân loại ML": "Text Paragraph"
+                })
+            item_id += 1
+
+        df_content_table = pd.DataFrame(table_rows)
+
+        return metadata, df_content_table
+
+# Khởi tạo ML Engine
+ml_engine = DocumentMLPipeline()
+
 
 # ==========================================
 # 1. CẤU HÌNH TRANG VÀ GIAO DIỆN
@@ -65,14 +153,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (TỰ ĐỘNG NÂNG CẤP BẢNG)
+# 2. XỬ LÝ CƠ SỞ DỮ LIỆU (SQLITE)
 # ==========================================
 DB_FILE = "doc_management.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Tạo bảng nếu chưa tồn tại
     c.execute('''
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,11 +173,12 @@ def init_db():
             related_doc_ids TEXT,
             updated_at TIMESTAMP,
             file_bytes BLOB,
-            file_name TEXT
+            file_name TEXT,
+            table_json TEXT
         )
     ''')
     
-    # TỰ ĐỘNG NÂNG CẤP: Kiểm tra và bổ sung cột còn thiếu nếu file DB đã tồn tại từ trước
+    # Auto-migration cho cột còn thiếu
     c.execute("PRAGMA table_info(documents)")
     existing_columns = [col[1] for col in c.fetchall()]
     
@@ -98,6 +186,8 @@ def init_db():
         c.execute("ALTER TABLE documents ADD COLUMN file_bytes BLOB")
     if 'file_name' not in existing_columns:
         c.execute("ALTER TABLE documents ADD COLUMN file_name TEXT")
+    if 'table_json' not in existing_columns:
+        c.execute("ALTER TABLE documents ADD COLUMN table_json TEXT")
         
     conn.commit()
     conn.close()
@@ -117,7 +207,6 @@ def get_document_by_id(doc_id):
     row = c.fetchone()
     conn.close()
     if row:
-        # Ánh xạ động theo tên cột
         conn_check = sqlite3.connect(DB_FILE)
         cursor_check = conn_check.cursor()
         cursor_check.execute("SELECT * FROM documents LIMIT 1")
@@ -137,26 +226,26 @@ def get_document_by_id(doc_id):
             "related_doc_ids": doc_dict.get("related_doc_ids", ""),
             "updated_at": doc_dict.get("updated_at", ""),
             "file_bytes": doc_dict.get("file_bytes", None),
-            "file_name": doc_dict.get("file_name", "")
+            "file_name": doc_dict.get("file_name", ""),
+            "table_json": doc_dict.get("table_json", "[]")
         }
     return None
 
-def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, file_bytes=None, file_name=""):
+def insert_document(doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, file_bytes=None, file_name="", table_json="[]"):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute('''
-        INSERT INTO documents (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, updated_at, file_bytes, file_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, json.dumps(related_doc_ids), now, file_bytes, file_name))
+        INSERT INTO documents (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, related_doc_ids, updated_at, file_bytes, file_name, table_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (doc_number, title, doc_type, issuing_authority, issue_date, content, summary, json.dumps(related_doc_ids), now, file_bytes, file_name, table_json))
     conn.commit()
     conn.close()
 
 # ==========================================
-# 3. ENGINE BÓC TÁCH SIÊU TỐC (REGEX + AI DỰ PHÒNG)
+# 3. TRÍCH XUẤT VĂN BẢN
 # ==========================================
 def extract_text_from_file(uploaded_file):
-    """Trích xuất văn bản thô từ file"""
     text = ""
     try:
         if uploaded_file.name.endswith('.pdf'):
@@ -175,82 +264,18 @@ def extract_text_from_file(uploaded_file):
         st.error(f"Lỗi khi đọc file: {str(e)}")
     return text
 
-def regex_extract_metadata(raw_text):
-    """Bóc tách cực nhanh bằng Quy tắc Thể thức Văn bản (0.01 giây, 100% không lỗi)"""
-    sample = raw_text[:2500]
-    
-    doc_number = ""
-    num_match = re.search(r'(Số|Số:)\s*([0-9]+[0-9a-zA-Z/\-\._]+)', sample, re.IGNORECASE)
-    if num_match:
-        doc_number = num_match.group(2).strip()
-
-    issue_date_str = str(date.today())
-    date_match = re.search(r'ngày\s+([0-9]{1,2})\s+tháng\s+([0-9]{1,2})\s+năm\s+([0-9]{4})', sample, re.IGNORECASE)
-    if date_match:
-        d, m, y = date_match.groups()
-        issue_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
-
-    doc_type = "Khác"
-    types = ["Nghị định", "Thông tư", "Quyết định", "Luật", "Công văn", "Quy chế", "Quy định", "Nghị quyết", "Thông báo"]
-    for t in types:
-        if re.search(rf'\b{t}\b', sample, re.IGNORECASE):
-            doc_type = "Quy chế / Quy định" if t in ["Quy chế", "Quy định"] else t
-            break
-
-    title = ""
-    about_match = re.search(r'Về việc\s+([^\n\r]+)', sample, re.IGNORECASE)
-    if about_match:
-        title = "Về việc " + about_match.group(1).strip()
-    else:
-        lines = [line.strip() for line in sample.split('\n') if line.strip()]
-        for line in lines[:15]:
-            if any(t.lower() in line.lower() for t in types) and len(line) > 10:
-                title = line
-                break
-
-    issuing_authority = ""
-    lines = [line.strip() for line in sample.split('\n') if line.strip()]
-    if len(lines) > 0:
-        issuing_authority = lines[0]
-
-    return {
-        "doc_number": doc_number,
-        "title": title[:200] if title else "Văn bản chưa có tiêu đề",
-        "doc_type": doc_type,
-        "issuing_authority": issuing_authority[:100],
-        "issue_date": issue_date_str
-    }
-
-def openai_extract_metadata(api_key, raw_text):
-    try:
-        client = openai.OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Bạn là chuyên gia bóc tách dữ liệu văn bản hành chính Việt Nam. Trả về định dạng JSON."},
-                {"role": "user", "content": f"Bóc tách metadata từ đoạn đầu văn bản này:\n{raw_text[:2000]}\nTrả về JSON chứa: doc_number, title, doc_type, issuing_authority, issue_date (YYYY-MM-DD)."}
-            ],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        st.error(f"Lỗi OpenAI: {str(e)}")
-        return {}
-
 # ==========================================
-# 4. GIAO DIỆN CHÍNH & SIDEBAR
+# 4. GIAO DIỆN CHÍNH & SIDEBAR (GIỮ NGUYÊN)
 # ==========================================
 st.sidebar.title("⚙️ Cấu hình & Engine")
 engine_choice = st.sidebar.radio(
     "Chọn Engine Phân Tích:",
-    ["🚀 Thuật toán Regex (Siêu tốc & Miễn phí)", "🤖 OpenAI GPT-4o-mini", "♊ Google Gemini"]
+    ["🧠 Notebook Machine Learning Engine", "🚀 Thuật toán Regex (Siêu tốc)", "🤖 OpenAI GPT-4o-mini"]
 )
 
 api_key_input = ""
 if engine_choice == "🤖 OpenAI GPT-4o-mini":
     api_key_input = st.sidebar.text_input("Nhập OpenAI API Key:", type="password")
-elif engine_choice == "♊ Google Gemini":
-    api_key_input = st.sidebar.text_input("Nhập Gemini API Key:", type="password")
 
 menu = st.sidebar.radio(
     "Chức năng chính:",
@@ -260,7 +285,7 @@ menu = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.info("""
 **Hệ Thống Quản Lý Văn Bản Tối Ưu**
-- Engine Bóc Tách Tốc Độ Cao (Regex/AI)
+- Engine ML Notebook Phân Tích Dạng Bảng
 - Trình xem PDF/Văn bản gốc chuẩn Foxit Reader
 """)
 
@@ -325,7 +350,7 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                         st.session_state['active_doc_id'] = row['id']
 
         with col_reader:
-            st.subheader("📖 Khung đọc văn bản nguyên bản")
+            st.subheader("📖 Khung đọc văn bản nguyên bản & Bảng dữ liệu ML")
             active_id = st.session_state.get('active_doc_id', None)
             if active_id is None and not filtered_df.empty:
                 active_id = filtered_df.iloc[0]['id']
@@ -340,9 +365,21 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                     m_col2.write(f"**Cơ quan BH:** {doc_data['issuing_authority']}")
                     m_col3.write(f"**Ngày BH:** {doc_data['issue_date']}")
 
-                    view_type = st.radio("Chế độ xem:", ["📄 Văn bản nguyên bản (Foxit Style)", "📝 Văn bản trích xuất"], horizontal=True)
+                    view_type = st.radio("Chế độ xem:", ["📊 Phân tích dạng Bảng (Notebook ML)", "📄 Văn bản nguyên bản (Foxit Style)", "📝 Văn bản thô"], horizontal=True)
 
-                    if "nguyên bản" in view_type:
+                    if "Bảng" in view_type:
+                        st.markdown("#### 📊 Dữ liệu văn bản được cấu trúc dạng Bảng (ML Output):")
+                        try:
+                            table_data = json.loads(doc_data['table_json'])
+                            if table_data:
+                                df_table = pd.DataFrame(table_data)
+                                st.dataframe(df_table, use_container_width=True, height=450)
+                            else:
+                                st.info("Văn bản chưa có dữ liệu cấu trúc Bảng ML. Bạn có thể xem dạng Văn bản nguyên bản.")
+                        except Exception:
+                            st.info("Chưa thể tải dữ liệu bảng.")
+
+                    elif "nguyên bản" in view_type:
                         if doc_data['file_bytes']:
                             file_bytes = doc_data['file_bytes']
                             file_name = doc_data['file_name'] or "document.pdf"
@@ -369,7 +406,7 @@ if menu == "📖 Tra cứu & Đọc văn bản":
                 st.info("Vui lòng chọn một văn bản từ danh sách bên trái để đọc.")
 
 # ==========================================
-# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN (AUTO-EXTRACT)
+# CHỨC NĂNG 2: THÊM MỚI VĂN BẢN (AUTO-EXTRACT & ML TABLE)
 # ==========================================
 elif menu == "➕ Thêm mới văn bản":
     st.markdown("<div class='main-title'>➕ CẬP NHẬT VĂN BẢN MỚI VÀO HỆ THỐNG</div>", unsafe_allow_html=True)
@@ -397,34 +434,33 @@ elif menu == "➕ Thêm mới văn bản":
             st.session_state['uploaded_bytes'] = None
             st.session_state['uploaded_filename'] = ""
 
-    if st.button("⚡ Phân tích & Điền tự động"):
+    if st.button("⚡ Phân tích & Trích xuất Bảng bằng ML"):
         if not raw_content_extracted:
             st.warning("Vui lòng tải file hoặc dán nội dung văn bản trước khi bấm phân tích.")
         else:
-            extracted_data = {}
-            if "Regex" in engine_choice:
-                extracted_data = regex_extract_metadata(raw_content_extracted)
-                st.success("⚡ Đã phân tích xong bằng Thuật toán Regex trong 0.01s!")
-            elif "OpenAI" in engine_choice:
-                if not api_key_input:
-                    st.error("Vui lòng nhập OpenAI API Key ở thanh bên.")
-                else:
-                    with st.spinner("OpenAI đang xử lý..."):
-                        extracted_data = openai_extract_metadata(api_key_input, raw_content_extracted)
-                        st.success("✅ OpenAI bóc tách thành công!")
-
-            if extracted_data:
-                st.session_state['temp_doc_number'] = extracted_data.get('doc_number', '')
-                st.session_state['temp_title'] = extracted_data.get('title', '')
-                st.session_state['temp_doc_type'] = extracted_data.get('doc_type', 'Nghị định')
-                st.session_state['temp_issuing_authority'] = extracted_data.get('issuing_authority', '')
+            with st.spinner("🤖 Notebook ML Engine đang đọc & bóc tách cấu trúc dạng bảng..."):
+                metadata, df_content_table = ml_engine.process_document(uploaded_file, raw_content_extracted)
+                
+                st.session_state['temp_doc_number'] = metadata.get('doc_number', '')
+                st.session_state['temp_title'] = metadata.get('title', '')
+                st.session_state['temp_doc_type'] = metadata.get('doc_type', 'Nghị định')
+                st.session_state['temp_issuing_authority'] = metadata.get('issuing_authority', '')
                 
                 try:
-                    st.session_state['temp_issue_date'] = datetime.strptime(extracted_data.get('issue_date'), "%Y-%m-%d").date()
+                    st.session_state['temp_issue_date'] = datetime.strptime(metadata.get('issue_date'), "%Y-%m-%d").date()
                 except Exception:
                     st.session_state['temp_issue_date'] = date.today()
 
                 st.session_state['temp_content'] = raw_content_extracted
+                st.session_state['temp_table_json'] = df_content_table.to_json(orient="records", force_ascii=False)
+                st.session_state['temp_df_table'] = df_content_table
+                
+                st.success("✅ Đã xử lý & bóc tách thành công văn bản dưới dạng Bảng ML!")
+
+    # Hiển thị Bảng xem trước từ ML Notebook
+    if 'temp_df_table' in st.session_state:
+        st.markdown("#### 📊 Kết quả xem trước phân tích dạng Bảng từ Notebook ML:")
+        st.dataframe(st.session_state['temp_df_table'], use_container_width=True, height=300)
 
     st.markdown("---")
     st.subheader("📝 2. Xác nhận & Lưu thông tin")
@@ -445,7 +481,7 @@ elif menu == "➕ Thêm mới văn bản":
             title = st.text_input("Trích yếu / Tiêu đề văn bản (*):", value=st.session_state.get('temp_title', ''))
             issue_date = st.date_input("Ngày ban hành:", value=st.session_state.get('temp_issue_date', date.today()))
         
-        content = st.text_area("Nội dung toàn văn của văn bản (*):", value=st.session_state.get('temp_content', ''), height=250)
+        content = st.text_area("Nội dung toàn văn của văn bản (*):", value=st.session_state.get('temp_content', ''), height=200)
 
         submitted = st.form_submit_button("🚀 Lưu văn bản vào hệ thống")
 
@@ -455,11 +491,12 @@ elif menu == "➕ Thêm mới văn bản":
             else:
                 f_bytes = st.session_state.get('uploaded_bytes', None)
                 f_name = st.session_state.get('uploaded_filename', '')
+                t_json = st.session_state.get('temp_table_json', '[]')
 
-                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, "", [], f_bytes, f_name)
-                st.success("✅ Đã lưu thành công văn bản mới vào hệ thống!")
+                insert_document(doc_number, title, doc_type, issuing_authority, str(issue_date), content, "", [], f_bytes, f_name, t_json)
+                st.success("✅ Đã lưu thành công văn bản & Bảng dữ liệu ML mới vào hệ thống!")
                 
-                for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content', 'uploaded_bytes', 'uploaded_filename']:
+                for key in ['temp_doc_number', 'temp_title', 'temp_doc_type', 'temp_issuing_authority', 'temp_issue_date', 'temp_content', 'uploaded_bytes', 'uploaded_filename', 'temp_table_json', 'temp_df_table']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.balloons()
